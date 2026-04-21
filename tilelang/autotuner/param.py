@@ -52,7 +52,7 @@ class CompileArgs:
     """
 
     out_idx: list[int] | int | None = None
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch"] = "auto"
+    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "auto"
     target: Literal["auto", "cuda", "hip"] = "auto"
     target_host: str | Target = None
     verbose: bool = False
@@ -62,6 +62,7 @@ class CompileArgs:
         return tilelang.compile(
             program,
             out_idx=self.out_idx,
+            execution_backend=self.execution_backend,
             target=self.target,
             target_host=self.target_host,
             verbose=self.verbose,

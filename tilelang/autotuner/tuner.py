@@ -30,6 +30,7 @@ import torch
 import os
 import sys
 import signal
+import time
 import json
 import hashlib
 import threading
@@ -132,6 +133,13 @@ class AutoTuner:
     _function_parameters: dict[str, Any] | None = None
     _lock = threading.Lock()  # For thread safety
     _memory_cache = {}  # In-memory cache dictionary
+    _compile_tunable_keys = {
+        "target",
+        "execution_backend",
+        "target_host",
+        "verbose",
+        "pass_configs",
+    }
 
     def __init__(self, fn: Callable, configs):
         self.fn = fn
@@ -168,7 +176,7 @@ class AutoTuner:
         self,
         out_idx: list[int] | int | None = None,
         target: Literal["auto", "cuda", "hip", "metal"] | None = None,
-        execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch"] | None = None,
+        execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
         target_host: str | Target | None = None,
         verbose: bool | None = None,
         pass_configs: dict[str, Any] | None = None,
@@ -390,7 +398,23 @@ class AutoTuner:
 
         def _compile(**config_arg) -> tilelang.JITKernel:
             compile_args = self.compile_args
-            return compile_args.compile_program(self.fn(**config_arg))
+            compile_override = config_arg.pop("__tl_compile_override", None) or {}
+
+            old_state = {
+                "target": compile_args.target,
+                "execution_backend": compile_args.execution_backend,
+                "target_host": compile_args.target_host,
+                "verbose": compile_args.verbose,
+                "pass_configs": compile_args.pass_configs,
+            }
+            try:
+                for k in self._compile_tunable_keys:
+                    if k in compile_override:
+                        setattr(compile_args, k, compile_override[k])
+                return compile_args.compile_program(self.fn(**config_arg))
+            finally:
+                for k, v in old_state.items():
+                    setattr(compile_args, k, v)
 
         if self.jit_compile is None:
             self.jit_compile = _compile
@@ -482,28 +506,33 @@ class AutoTuner:
 
             return latency, self.ref_latency_cache
 
-        config_args = []
+        parsed_configs: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         for config in self.configs:
-            new_kwargs = {}
-            keys = config.keys()
-            for name, _ in parameters.items():
+            kernel_kwargs: dict[str, Any] = {}
+            compile_kwargs: dict[str, Any] = {}
+            keys = set(config.keys())
+            for name in parameters.keys():
                 if name in config:
-                    new_kwargs[name] = config[name]
-            unused_keys = set(keys) - set(new_kwargs.keys())
+                    kernel_kwargs[name] = config[name]
+            for name in self._compile_tunable_keys:
+                if name in config:
+                    compile_kwargs[name] = config[name]
+            used_keys = set(kernel_kwargs.keys()) | set(compile_kwargs.keys())
+            unused_keys = keys - used_keys
             if len(unused_keys) > 0:
                 raise ValueError(f"Unused keys in config: {unused_keys}")
-            config_args.append(new_kwargs)
+            parsed_configs.append((kernel_kwargs, compile_kwargs, dict(config)))
 
-        if len(config_args) == 0:
+        if len(parsed_configs) == 0:
             raise ValueError("No configurations to tune, please check your `@autotune` decorator")
 
         # check if the tunable arguments has been set.
         # get the back config argument
-        top_config, *rest = config_args
+        top_kernel_config, _, _ = parsed_configs[0]
 
         if self._kernel_parameters is not None:
             key_args_tuple, key_kwargs_tuple = self._kernel_parameters
-            tunable_arguments = [key for key, _ in top_config.items()]
+            tunable_arguments = [key for key, _ in top_kernel_config.items()]
 
             def check_tunable_argument_value(key, parameters, key_args_tuple) -> bool:
                 params_list = list(parameters.keys())
@@ -511,7 +540,7 @@ class AutoTuner:
                 return params_list.index(key) < len(key_args_tuple)
 
             # Check if all tunable arguments have been tuned by comparing config keys with key_kwargs_tuple
-            if any(key in top_config for key, _ in key_kwargs_tuple) or any(
+            if any(key in top_kernel_config for key, _ in key_kwargs_tuple) or any(
                 check_tunable_argument_value(key, self._function_parameters, key_args_tuple) for key in tunable_arguments
             ):
                 logger.warning(
@@ -545,6 +574,7 @@ class AutoTuner:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
         futures = []
         future_to_index = {}
+        future_submit_time = {}
 
         def cuda_device_wrapper(func, device):
             def inner(**config_arg):
@@ -553,7 +583,7 @@ class AutoTuner:
 
             return inner
 
-        for i, config_arg in enumerate(config_args):
+        for i, (kernel_config_arg, compile_config_arg, _full_config_arg) in enumerate(parsed_configs):
             compile_func = self.jit_compile
 
             if torch.cuda.is_available():
@@ -563,21 +593,52 @@ class AutoTuner:
 
             future = pool.submit(
                 compile_func,
-                **config_arg,
+                __tl_compile_override=compile_config_arg,
+                **kernel_config_arg,
             )
             futures.append(future)
             future_to_index[future] = i
+            future_submit_time[future] = time.monotonic()
 
-        results_with_configs = []
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Compiling configurations"):
-            idx = future_to_index[future]
-            config = config_args[idx]
-            try:
-                result = future.result()
-                results_with_configs.append((result, config))
-            except Exception as e:
-                logger.debug(f"Compilation failed for config {config} at index {idx} with error: {e}")
-                continue
+        results_with_configs: list[tuple[tilelang.JITKernel, dict[str, Any]]] = []
+        compile_timeout = max(int(timeout), 1)
+        pending = set(futures)
+        with tqdm(total=len(futures), desc="Compiling configurations") as compile_pbar:
+            while pending:
+                done_now, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=1.0,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+
+                for future in done_now:
+                    idx = future_to_index[future]
+                    config = parsed_configs[idx][2]
+                    try:
+                        result = future.result()
+                        results_with_configs.append((result, config))
+                    except Exception as e:
+                        logger.debug(f"Compilation failed for config {config} at index {idx} with error: {e}")
+                        logger.debug("Compilation traceback:\n%s", traceback.format_exc())
+                    finally:
+                        compile_pbar.update(1)
+
+                now = time.monotonic()
+                timed_out = [
+                    f for f in pending if now - future_submit_time[f] > compile_timeout
+                ]
+                for future in timed_out:
+                    idx = future_to_index[future]
+                    config = parsed_configs[idx][2]
+                    logger.warning(
+                        "A compile timeout occurred while building config %s at index %s (>%ss), skipping.",
+                        config,
+                        idx,
+                        compile_timeout,
+                    )
+                    future.cancel()
+                    pending.remove(future)
+                    compile_pbar.update(1)
 
         ref_latency = None
         progress_bar = tqdm(range(len(results_with_configs)), desc="Bench configurations")
@@ -604,7 +665,7 @@ class AutoTuner:
             progress_bar.set_postfix({"best_latency": best_latency})
             tqdm.write(f"Tuned Latency {latency} with config {config} at index {i}")
 
-        pool.shutdown()
+        pool.shutdown(wait=False, cancel_futures=True)
 
         if best_kernel is None:
             error_msg = "Auto-tuning failed: No configuration successfully compiled and passed benchmarking/validation."
@@ -699,27 +760,90 @@ class AutoTuneImpl(Generic[_P, _T]):
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> JITKernel | _T:
         return_kernel = kwargs.pop("__return_kernel", False)
+        call_time_compile_override = kwargs.pop("__tl_compile_override", None)
+        logger.debug("AutoTuner.__call__ kwargs keys: %s", list(kwargs.keys()))
 
         mode = self.jit_impl.initialize_jit_mode(*args, **kwargs)
 
         norm_args = _normalize_value(args, sort_dict_items=True)
         norm_kwargs = _normalize_value(kwargs, sort_dict_items=True)
         key = (norm_args, norm_kwargs)
+        compile_tunable_keys = AutoTuner._compile_tunable_keys
         if key not in self._tuner_cache:
+            def apply_compile_overrides(override: dict[str, Any] | None):
+                old_state = {
+                    "target": self.jit_impl.target,
+                    "execution_backend": self.jit_impl.execution_backend,
+                    "target_host": self.jit_impl.target_host,
+                    "verbose": self.jit_impl.verbose,
+                    "pass_configs": self.jit_impl.pass_configs,
+                }
+                if not override:
+                    return old_state
+
+                target = override.get("target", self.jit_impl.target)
+                if isinstance(target, Target):
+                    target_obj = target
+                else:
+                    target_obj = Target(determine_target(target))
+
+                from tilelang.jit.execution_backend import resolve_execution_backend
+
+                backend_req = override.get("execution_backend", self.jit_impl.execution_backend)
+                backend = resolve_execution_backend(backend_req, target_obj)
+
+                self.jit_impl.target = target_obj
+                self.jit_impl.execution_backend = backend
+                self.jit_impl.target_host = override.get("target_host", self.jit_impl.target_host)
+                self.jit_impl.verbose = override.get("verbose", self.jit_impl.verbose)
+                self.jit_impl.pass_configs = override.get("pass_configs", self.jit_impl.pass_configs)
+                return old_state
+
+            def restore_compile_overrides(old_state: dict[str, Any]) -> None:
+                self.jit_impl.target = old_state["target"]
+                self.jit_impl.execution_backend = old_state["execution_backend"]
+                self.jit_impl.target_host = old_state["target_host"]
+                self.jit_impl.verbose = old_state["verbose"]
+                self.jit_impl.pass_configs = old_state["pass_configs"]
+
             if mode == "lazy":
 
-                def jit_compile(**config_arg):
-                    return self.jit_impl(*args, **kwargs, __tune_params=config_arg)
+                def jit_compile(__tl_compile_override: dict[str, Any] | None = None, **config_arg):
+                    merged_override = {}
+                    if call_time_compile_override:
+                        merged_override.update(call_time_compile_override)
+                    if __tl_compile_override:
+                        merged_override.update(__tl_compile_override)
+                    old_state = apply_compile_overrides(merged_override)
+                    try:
+                        config_arg.pop("__tl_compile_override", None)
+                        merged = dict(kwargs)
+                        merged.update(config_arg)
+                        merged.pop("__tl_compile_override", None)
+                        return self.jit_impl.compile(*args, **merged)
+                    finally:
+                        restore_compile_overrides(old_state)
 
                 autotuner = self.get_tunner()
                 autotuner.jit_compile = jit_compile
                 autotuner.set_kernel_parameters(key, self.jit_impl.signature.parameters)
             else:
 
-                def jit_compile(**config_arg):
+                def jit_compile(__tl_compile_override: dict[str, Any] | None = None, **config_arg):
+                    merged_override = {}
+                    if call_time_compile_override:
+                        merged_override.update(call_time_compile_override)
+                    if __tl_compile_override:
+                        merged_override.update(__tl_compile_override)
+                    old_state = apply_compile_overrides(merged_override)
+                    config_arg.pop("__tl_compile_override", None)
                     merged = dict(kwargs)
                     merged.update(config_arg)
-                    return self.jit_impl.compile(*args, **merged)
+                    merged.pop("__tl_compile_override", None)
+                    try:
+                        return self.jit_impl.compile(*args, **merged)
+                    finally:
+                        restore_compile_overrides(old_state)
 
                 autotuner = self.get_tunner()
                 autotuner.jit_compile = jit_compile
@@ -737,7 +861,10 @@ class AutoTuneImpl(Generic[_P, _T]):
                 return best_kernel
             exec_kwargs = dict(kwargs)
             if best_config is not None:
-                exec_kwargs.update(best_config)
+                for k, v in best_config.items():
+                    if k in compile_tunable_keys:
+                        continue
+                    exec_kwargs[k] = v
             _, kernel_args = self.jit_impl.func.parse_args(*args, **exec_kwargs)
             return best_kernel(*kernel_args.values())
 
@@ -788,6 +915,9 @@ def autotune(  # This is the new public interface
         the function to be decorated (and `out_idx` will be `None`).
     configs : Dict or Callable
         Configuration space to explore during auto-tuning.
+        In addition to kernel function parameters, autotune natively supports
+        compile-dimension keys:
+        ``target``, ``execution_backend``, ``target_host``, ``verbose``, ``pass_configs``.
     warmup : int, optional
         Number of warmup iterations before timing.
     rep : int, optional

@@ -1111,6 +1111,16 @@ class JITFunc(Generic[_P, _T]):
         # we don't want it to show up in the constructor
         self.p1_cache: dict[Any, TirTemplate[_P, _T]] = {}
 
+    @staticmethod
+    def _freeze_cache_value(value):
+        if isinstance(value, dict):
+            return tuple(sorted((str(k), JITFunc._freeze_cache_value(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(JITFunc._freeze_cache_value(v) for v in value)
+        if isinstance(value, set):
+            return tuple(sorted(JITFunc._freeze_cache_value(v) for v in value))
+        return value
+
     def _parse_phase1_key(self, *args, **kwargs):
         kwargs.update({k: v for k, v in zip(self.arg_names, args)})
         tensor_args = {}
@@ -1119,7 +1129,7 @@ class JITFunc(Generic[_P, _T]):
                 tensor_args[k] = kwargs.pop(k)
             elif k in self.tensor_args_defaults:
                 tensor_args[k] = self.tensor_args_defaults[k]
-        p1_key = tuple(sorted(kwargs.items()))
+        p1_key = tuple(sorted((k, self._freeze_cache_value(v)) for k, v in kwargs.items()))
         return p1_key, tensor_args, kwargs
 
     def _is_lazy_style(self, *args, **kwargs) -> bool:

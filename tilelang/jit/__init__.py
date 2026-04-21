@@ -44,6 +44,14 @@ _T = TypeVar("_T")
 _Ret = TypeVar("_Ret")
 
 
+def _normalize_cache_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _normalize_cache_value(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize_cache_value(v) for v in value)
+    return value
+
+
 def compile(
     func: PrimFunc[_KP, _T] = None,
     out_idx: list[int] | int | None = None,
@@ -426,8 +434,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     def parse_cache_key(self, *args: _P.args, **kwargs: _P.kwargs):
         tune_params = kwargs.pop("__tune_params", {})
         key_args_tuple = args
-        key_kwargs_tuple = tuple(sorted(kwargs.items()))
-        tuned_key_kwargs_tuple = tuple(sorted(tune_params.items()))
+        key_kwargs_tuple = tuple(sorted((k, _normalize_cache_value(v)) for k, v in kwargs.items()))
+        tuned_key_kwargs_tuple = tuple(sorted((k, _normalize_cache_value(v)) for k, v in tune_params.items()))
         key = (key_args_tuple, key_kwargs_tuple, tuned_key_kwargs_tuple)
         return key
 
