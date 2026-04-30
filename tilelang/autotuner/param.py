@@ -21,6 +21,7 @@ import json
 import hashlib
 import uuid
 from tilelang import env
+from tilelang.cache.kernel_cache import KernelCache
 from tvm.runtime import Executable
 
 BEST_CONFIG_PATH = "best_config.json"
@@ -104,6 +105,9 @@ class ProfileArgs:
         skip_check: bool = False
         manual_check_prog: Callable = None
         cache_input_tensors: bool = True
+    grid_search_mode: bool = False
+    cooldown_time: float = 2.0
+    cooldown_time: float = 2.0
     """
 
     warmup: int = 25
@@ -119,6 +123,8 @@ class ProfileArgs:
     skip_check: bool = False
     manual_check_prog: Callable = None
     cache_input_tensors: bool = True
+    grid_search_mode: bool = False
+    cooldown_time: float = 2.0
 
     def __hash__(self):
         data = {
@@ -177,7 +183,7 @@ class AutotuneResult:
         tmp_dir = env.TILELANG_TMP_DIR
         os.makedirs(tmp_dir, exist_ok=True)
         temp_path = os.path.join(tmp_dir, f"{os.getpid()}_{uuid.uuid4()}.so")
-        executable.export_library(temp_path)
+        executable.export_library(temp_path, **KernelCache._get_compile_args())
         os.replace(temp_path, path)
 
     def _save_kernel_to_disk(self, cache_path: Path, kernel: JITKernel, verbose: bool = False):

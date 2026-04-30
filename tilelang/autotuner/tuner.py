@@ -53,6 +53,13 @@ def timeout_handler(signum, frame):
 
 
 def run_with_timeout(func, timeout, *args, **kwargs):
+    # SIGALRM is only allowed on the main thread; Gradio/FastAPI workers call autotune
+    # from a background thread, where every bench config would fail otherwise.
+    if threading.current_thread() is not threading.main_thread():
+        return func(*args, **kwargs)
+    if not hasattr(signal, "SIGALRM"):
+        return func(*args, **kwargs)
+
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(timeout)
     try:
@@ -231,6 +238,8 @@ class AutoTuner:
         warmup: int = 25,
         rep: int = 100,
         timeout: int = 30,
+        grid_search_mode: bool = False,
+        cooldown_time: float = 2.0,
         supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto,
         ref_prog: Callable = None,
         supply_prog: Callable = None,
@@ -282,6 +291,8 @@ class AutoTuner:
             rep=rep,
             timeout=timeout,
             backend=backend,
+            grid_search_mode=grid_search_mode,
+            cooldown_time=cooldown_time,
         )
 
         # If a custom `supply_prog` is provided, the profiler's `supply_type` setting
@@ -492,6 +503,21 @@ class AutoTuner:
                     profiler.assert_allclose(
                         ref_prog, input_tensors=self.jit_input_tensors, rtol=rtol, atol=atol, max_mismatched_ratio=max_mismatched_ratio
                     )
+            # Grid search mode: aggressive cooling to eliminate thermal state pollution
+            # In grid search mode, each config is tested independently with full GPU cooldown
+
+            if profile_args.grid_search_mode:
+                # Force full synchronization and extended idle period
+                torch.cuda.synchronize()
+                time.sleep(profile_args.cooldown_time)
+                # Optional: reset GPU clock throttling by briefly idling compute resources
+                dummy = torch.zeros(1, device='cuda')
+                del dummy
+                torch.cuda.synchronize()
+            else:
+                # Streaming mode: minimal synchronization for faster tuning
+                torch.cuda.synchronize()
+                time.sleep(0.5)
             latency = profiler.do_bench(warmup=warmup, rep=rep, input_tensors=self.jit_input_tensors, backend=backend)
 
             if self.ref_latency_cache is None and ref_prog is not None:
@@ -728,6 +754,8 @@ class AutoTuneImpl(Generic[_P, _T]):
     skip_check: bool = False
     manual_check_prog: Callable = None
     cache_input_tensors: bool = False
+    grid_search_mode: bool = False
+    cooldown_time: float = 2.0
 
     def __post_init__(self):
         self._tuner_cache = {}
@@ -745,6 +773,8 @@ class AutoTuneImpl(Generic[_P, _T]):
                 skip_check=self.skip_check,
                 manual_check_prog=self.manual_check_prog,
                 cache_input_tensors=self.cache_input_tensors,
+                grid_search_mode=self.grid_search_mode,
+                cooldown_time=self.cooldown_time,
             )
             .set_compile_args(
                 out_idx=self.jit_impl.out_idx,
@@ -880,6 +910,8 @@ def autotune(  # This is the new public interface
     warmup: int = 25,
     rep: int = 100,
     timeout: int = 100,
+    grid_search_mode: bool = False,
+    cooldown_time: float = 2.0,
     # compile arguments
     supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto,
     ref_prog: Callable = None,
@@ -968,6 +1000,8 @@ def autotune(  # This is the new public interface
                 skip_check=skip_check,
                 manual_check_prog=manual_check_prog,
                 cache_input_tensors=cache_input_tensors,
+                grid_search_mode=grid_search_mode,
+                cooldown_time=cooldown_time,
             )
 
         return decorator

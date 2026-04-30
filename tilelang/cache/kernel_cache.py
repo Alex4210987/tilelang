@@ -24,6 +24,41 @@ from tilelang import env
 from tilelang.jit import JITKernel
 from tilelang import __version__
 import platform
+from pathlib import Path
+
+
+def _tvm_runtime_include_flags() -> list[str]:
+    """Host-side export_library compiles generated C/C++ that includes tvm/runtime/*.h.
+
+    TVM Python only adds tvm_ffi headers by default; the real tree lives under this
+    repo's ``tilelang/3rdparty/tvm/include``. Optional override: env ``TILELANG_TVM_INCLUDE``.
+    """
+    flags: list[str] = []
+    seen: set[str] = set()
+    for inc in _tvm_runtime_include_dirs():
+        if inc not in seen:
+            seen.add(inc)
+            flags.append("-I" + inc)
+    return flags
+
+
+@functools.cache
+def _tvm_runtime_include_dirs() -> tuple[str, ...]:
+    dirs: list[str] = []
+    env_p = os.environ.get("TILELANG_TVM_INCLUDE") or os.environ.get("TVM_INCLUDE_PATH")
+    if env_p:
+        ap = os.path.abspath(env_p)
+        if os.path.isdir(ap):
+            dirs.append(ap)
+    try:
+        import tilelang as _tl
+
+        p = Path(_tl.__file__).resolve().parent.parent / "3rdparty" / "tvm" / "include"
+        if p.is_dir():
+            dirs.append(str(p))
+    except Exception:
+        pass
+    return tuple(dirs)
 
 
 class KernelCache:
@@ -52,12 +87,21 @@ class KernelCache:
     @staticmethod
     @functools.cache
     def _get_compile_args() -> dict:
-        if sys.platform != "darwin":
-            return {}
+        tvm_inc_opts = _tvm_runtime_include_flags()
 
-        from torch.utils import cpp_extension
+        if sys.platform == "darwin":
+            from torch.utils import cpp_extension
 
-        return {"options": ["-x", "objective-c++", "-g", "-std=gnu++17"] + ["-I" + i for i in cpp_extension.include_paths()]}
+            opts = (
+                ["-x", "objective-c++", "-g", "-std=gnu++17"]
+                + ["-I" + i for i in cpp_extension.include_paths()]
+                + tvm_inc_opts
+            )
+            return {"options": opts}
+
+        if tvm_inc_opts:
+            return {"options": ["-std=gnu++17"] + tvm_inc_opts}
+        return {}
 
     @staticmethod
     @functools.cache
